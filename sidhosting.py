@@ -46,7 +46,7 @@ WEB_DIR = os.environ.get("WEB_DIR") or (
 # Every /api/* route requires this bearer token. Set ADMIN_API_TOKEN yourself
 # in production; if left unset we generate one at startup and print it once
 # so the dashboard still works, but you should pin a real value via env vars.
-ADMIN_API_TOKEN = os.environ.get("8032494974:AAE3s6Uh0c-KdWsXDd5ZP_R6h6KixSUt-dw") or _secrets.token_urlsafe(24)
+ADMIN_API_TOKEN = os.environ.get("some-long-random-secret") or _secrets.token_urlsafe(24)
 if not os.environ.get("2119464081"):
     print(f"⚠️  ADMIN_API_TOKEN not set — generated a temporary one for this run:\n    {ADMIN_API_TOKEN}\n"
           f"    Set ADMIN_API_TOKEN in your environment to keep it stable across restarts.")
