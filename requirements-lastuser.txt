@@ -1,8 +1,0 @@
-# Dependencies for lastuser.py (Userbot Hosting service — hoster + userbot core)
-python-telegram-bot>=20.7
-telethon>=1.34.0
-Flask>=3.0.0
-requests>=2.31.0
-qrcode>=7.4.2
-gTTS>=2.5.1
-yt-dlp>=2024.3.10
