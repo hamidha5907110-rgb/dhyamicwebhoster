@@ -1766,70 +1766,47 @@ const state = {
   botLocked: false,
   logsPaused: false,
   startTime: Date.now(),
-  totalMessages: 14872,
-  totalBots: 53,
-  totalCmds: 2940,
-  scripts: [
-    { name: 'sidhosting.py', type: 'py', user: 2119464081, status: 'running', pid: 12345, uptime: 7240 },
-    { name: 'userbot_main.py', type: 'py', user: 983241233, status: 'running', pid: 12388, uptime: 3600 },
-    { name: 'notif_bot.js', type: 'js', user: 771234561, status: 'running', pid: 12401, uptime: 1800 },
-    { name: 'scraper.py', type: 'py', user: 555123456, status: 'stopped', pid: null, uptime: 0 },
-    { name: 'news_feed.js', type: 'js', user: 332198771, status: 'stopped', pid: null, uptime: 0 },
-  ],
-  subscriptions: [
-    { uid: 983241233, plan: 'Premium', expiry: '2025-07-20', daysLeft: 32 },
-    { uid: 771234561, plan: 'Standard', expiry: '2025-07-05', daysLeft: 17 },
-    { uid: 555123456, plan: 'Premium', expiry: '2025-06-25', daysLeft: 7 },
-    { uid: 332198771, plan: 'Standard', expiry: '2025-06-20', daysLeft: 2 },
-    { uid: 441092312, plan: 'Standard', expiry: '2025-06-18', daysLeft: 0 },
-    { uid: 112345671, plan: 'Expired', expiry: '2025-06-10', daysLeft: -8 },
-  ],
-  admins: [
-    { uid: 2119464081, username: '@Xricx0', role: 'owner', since: '2024-01-01' },
-    { uid: 771234561, username: '@AdminBot1', role: 'admin', since: '2024-03-15' },
-    { uid: 332198771, username: '@ModUser2', role: 'admin', since: '2024-05-01' },
-  ],
+  totalMessages: 0,
+  totalBots: 0,
+  totalCmds: 0,
+  scripts: [],
+  subscriptions: [],
+  admins: [],
   broadcastHistory: [],
   logEntries: [],
-  securityEvents: [
-    { t: 'BLOCKED', msg: 'Blocked .exe upload from user 4481234', level: 'error' },
-    { t: 'SCAN', msg: 'All 5 scripts passed malware scan', level: 'success' },
-    { t: 'AUTH', msg: 'Admin login from @AdminBot1', level: 'info' },
-    { t: 'LOCK', msg: 'Bot was temporarily locked by Owner', level: 'warn' },
-  ],
-  userbots: [
-    { uid: 2119464081, slot: 0, phone: '+91••••••210', name: 'Owner Account', status: 'running', uptime: 51200, cmds: 812 },
-    { uid: 983241233, slot: 0, phone: '+1••••••047',  name: 'Alex\'s Userbot', status: 'running', uptime: 9040,  cmds: 214 },
-  ]
+  securityEvents: [],
+  userbots: []
 };
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Backend config — fill these in once you deploy sidhosting.py /
-// lastuser.py with the API patch (see backend/README.md). Left blank,
-// the dashboard runs fully on demo data so the UI still feels alive.
+// Backend config — Railway serves the dashboard and backend from one origin.
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 const CONFIG = {
-  BOT_API_BASE: '',      // e.g. 'https://your-sidhosting-host.example.com'
-  USERBOT_API_BASE: '',  // e.g. 'https://your-lastuser-host.example.com'
-  ADMIN_TOKEN: 2119464081'',       // value of ADMIN_API_TOKEN set on the backend
+  // Railway serves the dashboard and APIs from the same origin.
+  // The backend injects the real ADMIN_API_TOKEN into this placeholder.
+  BOT_API_BASE: '',
+  USERBOT_API_BASE: '',
+  ADMIN_TOKEN: '__ADMIN_API_TOKEN__'
 };
 async function apiFetch(base, path, opts = {}) {
-  try {
-    const url = (base || '').replace(/\/$/, '') + path; // '' base = same-origin relative fetch
-    const res = await fetch(url, {
-      ...opts,
-      headers: {
-        'Content-Type': 'application/json',
-        ...(CONFIG.ADMIN_TOKEN ? { 'Authorization': 'Bearer ' + CONFIG.ADMIN_TOKEN } : {}),
-        ...(opts.headers || {}),
-      },
-    });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    return await res.json();
-  } catch (e) {
-    console.warn('API unreachable, using demo data:', e.message);
-    return null;
+  const url = (base || '').replace(/\/$/, '') + path;
+  const res = await fetch(url, {
+    ...opts,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(CONFIG.ADMIN_TOKEN ? { 'Authorization': 'Bearer ' + CONFIG.ADMIN_TOKEN } : {}),
+      ...(opts.headers || {}),
+    },
+  });
+  if (!res.ok) {
+    let detail = '';
+    try {
+      const body = await res.json();
+      detail = body.error || body.message || '';
+    } catch (_) {}
+    throw new Error((detail ? detail + ' — ' : '') + 'HTTP ' + res.status);
   }
+  return await res.json();
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2294,27 +2271,24 @@ function renderSecurityLog() {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Speed / System simulation
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-function updateSystemStats() {
-  const cpu = 20 + Math.random() * 40;
-  const mem = 45 + Math.random() * 25;
-  const lat = 50 + Math.random() * 80;
-  const cpuBar = document.getElementById('cpu-bar');
-  const memBar = document.getElementById('mem-bar');
-  const cpuVal = document.getElementById('cpu-val');
-  const memVal = document.getElementById('mem-val');
-  const speedNum = document.getElementById('speed-num');
-  const speedArc = document.getElementById('speed-arc');
-  if (cpuBar) cpuBar.style.width = cpu + '%';
-  if (memBar) memBar.style.width = mem + '%';
-  if (cpuVal) cpuVal.textContent = Math.round(cpu) + '%';
-  if (memVal) memVal.textContent = Math.round(mem) + '%';
-  if (speedNum) speedNum.textContent = Math.round(lat);
-  if (speedArc) {
-    const pct = 1 - (lat / 200);
-    speedArc.setAttribute('stroke-dashoffset', 220 * (1 - pct));
+async function updateSystemStats() {
+  try {
+    const data = await apiFetch(CONFIG.BOT_API_BASE, '/api/system');
+    const cpu = Number(data.cpu || 0);
+    const mem = Number(data.memory || 0);
+    const cpuBar = document.getElementById('cpu-bar');
+    const memBar = document.getElementById('mem-bar');
+    const cpuVal = document.getElementById('cpu-val');
+    const memVal = document.getElementById('mem-val');
+    if (cpuBar) cpuBar.style.width = cpu + '%';
+    if (memBar) memBar.style.width = mem + '%';
+    if (cpuVal) cpuVal.textContent = Math.round(cpu) + '%';
+    if (memVal) memVal.textContent = Math.round(mem) + '%';
+    const speedNum = document.getElementById('speed-num');
+    if (speedNum) speedNum.textContent = Math.round(cpu + mem);
+  } catch (e) {
+    console.warn('System metrics unavailable:', e.message);
   }
-  // Update uptime of running scripts
-  state.scripts.forEach(s => { if (s.status === 'running') s.uptime++; });
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2343,11 +2317,111 @@ function tickLog() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Live dashboard sync
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+let liveApiReady = false;
+async function refreshDashboardFromApi() {
+  try {
+    const [stats, scripts, files, subs, admins, security] = await Promise.all([
+      apiFetch(CONFIG.BOT_API_BASE, '/api/stats'),
+      apiFetch(CONFIG.BOT_API_BASE, '/api/scripts'),
+      apiFetch(CONFIG.BOT_API_BASE, '/api/files'),
+      apiFetch(CONFIG.BOT_API_BASE, '/api/subscriptions'),
+      apiFetch(CONFIG.BOT_API_BASE, '/api/admins'),
+      apiFetch(CONFIG.BOT_API_BASE, '/api/security')
+    ]);
+
+    if (scripts && Array.isArray(scripts.scripts)) {
+      state.scripts = scripts.scripts.map(s => ({
+        name: s.file_name || 'Unknown',
+        type: s.type || 'py',
+        user: s.owner ?? '—',
+        status: s.status || 'stopped',
+        pid: s.pid || null,
+        uptime: Number(s.uptime || 0),
+        key: s.key
+      }));
+    }
+
+    if (files && Array.isArray(files.files) && (!scripts || !scripts.scripts)) {
+      state.scripts = files.files.map(f => ({
+        name: f.file_name || 'Unknown',
+        type: (f.file_type || '').includes('javascript') ? 'js' : 'py',
+        user: f.user_id ?? '—',
+        status: 'stopped',
+        pid: null,
+        uptime: 0
+      }));
+    }
+
+    if (subs && Array.isArray(subs.subscriptions)) {
+      const now = Date.now();
+      state.subscriptions = subs.subscriptions.map(s => {
+        const expiry = s.expiry || '';
+        const daysLeft = Math.ceil((new Date(expiry).getTime() - now) / 86400000);
+        return {
+          uid: Number(s.user_id),
+          plan: daysLeft > 0 ? 'Premium' : 'Expired',
+          expiry: expiry.slice(0, 10),
+          daysLeft
+        };
+      });
+    }
+
+    if (admins && Array.isArray(admins.admins)) {
+      state.admins = admins.admins.map((uid, i) => ({
+        uid: Number(uid),
+        username: '@user_' + uid,
+        role: i === 0 ? 'owner' : 'admin',
+        since: '—'
+      }));
+    }
+
+    if (stats) {
+      state.totalBots = Number(stats.files || 0);
+      state.totalCmds = 0;
+      state.totalMessages = Number(stats.users || 0);
+      state.botLocked = !!stats.locked;
+    }
+    if (security) state.botLocked = !!security.locked;
+
+    liveApiReady = true;
+    renderScripts();
+    renderFiles();
+    renderSubs();
+    renderAdmins();
+    renderUserbots();
+    renderSystemFromLive();
+    return true;
+  } catch (e) {
+    liveApiReady = false;
+    console.warn('Live API sync failed:', e.message);
+    return false;
+  }
+}
+
+function renderSystemFromLive() {
+  const banner = document.getElementById('lock-banner');
+  const btn = document.getElementById('lock-btn');
+  const txt = document.getElementById('lock-status-text');
+  if (banner) banner.style.display = state.botLocked ? 'flex' : 'none';
+  if (btn) {
+    btn.textContent = state.botLocked ? '🔓 Unlock Bot' : '🔒 Lock Bot';
+    btn.className = state.botLocked ? 'btn btn-success' : 'btn btn-danger';
+  }
+  if (txt) txt.textContent = state.botLocked ? 'Status: 🔒 Locked' : 'Status: 🔓 Unlocked';
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Userbot accounts
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 async function refreshUserbotsFromApi() {
-  const data = await apiFetch(CONFIG.USERBOT_API_BASE, '/api/userbot/accounts');
-  if (data && Array.isArray(data.accounts)) { state.userbots = data.accounts; }
+  try {
+    const data = await apiFetch(CONFIG.USERBOT_API_BASE, '/api/userbot/accounts');
+    if (data && Array.isArray(data.accounts)) state.userbots = data.accounts;
+  } catch (e) {
+    console.warn('Userbot API sync failed:', e.message);
+  }
 }
 function renderUserbots() {
   const list = document.getElementById('userbot-list');
@@ -2442,7 +2516,11 @@ async function loginSendCode(isResend=false) {
     method: 'POST', body: JSON.stringify({ phone })
   });
   if (btn) { btn.textContent = 'Send Code'; btn.disabled = false; }
-  loginFlow.pendingId = data ? data.pending_id : 'demo';
+  if (!data || !data.pending_id) {
+    toast((data && data.message) || 'Userbot API is unavailable', 'error');
+    return;
+  }
+  loginFlow.pendingId = data.pending_id;
   document.getElementById('login-phone-echo').textContent = phone;
   if (!isResend) showLoginStep('code');
   else toast('Code re-sent', 'info');
@@ -2456,8 +2534,7 @@ async function loginVerifyCode() {
   });
   if (data && data.status === 'needs_2fa') { showLoginStep('2fa'); return; }
   if (data && data.status === 'error') { toast(data.message || 'Invalid code', 'error'); return; }
-  // demo mode or success
-  if (!CONFIG.USERBOT_API_BASE && Math.random() < 0.3) { showLoginStep('2fa'); return; } // occasionally demo the 2FA path
+  if (!data) { toast('Userbot API is unavailable', 'error'); return; }
   completeLogin(data);
 }
 async function loginVerify2fa() {
@@ -2587,9 +2664,9 @@ function countUp(id, target, suffix='') {
   }, 25);
 }
 function animateHeroStats() {
-  countUp('hs-bots', state.scripts.length + 51);
-  countUp('hs-userbots', state.userbots.length + 34);
-  countUp('hs-uptime', 99, '.9%');
+  countUp('hs-bots', state.scripts.length);
+  countUp('hs-userbots', state.userbots.length);
+  countUp('hs-uptime', 100, '%');
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2606,26 +2683,20 @@ function init() {
   // Show dashboard directly if linked to with #dashboard, otherwise land on the site
   if (location.hash === '#dashboard') showApp(); else showSite();
 
-  // Try pulling real data once; silently keeps demo data if no backend is configured
+  // Connect to the real Railway backend (same origin) and keep the dashboard synchronized.
+  refreshDashboardFromApi();
   refreshUserbotsFromApi().then(renderUserbots);
-
-  // Initial logs
-  const initLogs = [
-    ['🤖 SID Hosting Bot started', 'success'],
-    ['Flask keep-alive server running on :8080', 'info'],
-    ['Database initialized — loaded 247 users, 12 subscriptions', 'info'],
-    ['3 scripts running from previous session', 'success'],
-    ['Malware scanner active', 'success'],
-    ['Polling started...', 'dim'],
-  ];
-  initLogs.forEach(([m,l], i) => setTimeout(() => addLog(m, l), i * 300));
-
-  // Simulation ticks
+  setInterval(refreshDashboardFromApi, 5000);
+  setInterval(refreshUserbotsFromApi, 5000);
+  updateSystemStats();
   setInterval(updateSystemStats, 3000);
-  setInterval(tickLog, 4500);
   setInterval(updateUptime, 1000);
   setInterval(() => {
-    if (document.getElementById('page-files').classList.contains('active')) renderFiles();
+    if (liveApiReady) {
+      renderScripts();
+      renderFiles();
+      renderUserbots();
+    }
   }, 5000);
 }
 
