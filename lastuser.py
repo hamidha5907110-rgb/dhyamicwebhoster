@@ -6423,7 +6423,7 @@ else:
     except ImportError:
         _FLASK_AVAILABLE = False
 
-    WEB_ADMIN_TOKEN = os.environ.get("ADMIN_API_TOKEN") or _secrets.token_urlsafe(24)
+    WEB_ADMIN_TOKEN = os.environ.get("some-long-random-secret") or _secrets.token_urlsafe(24)
     if not os.environ.get("ADMIN_API_TOKEN"):
         print(f"⚠️  ADMIN_API_TOKEN not set — generated a temporary one for this run:\n"
               f"    {WEB_ADMIN_TOKEN}\n"
