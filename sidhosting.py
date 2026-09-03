@@ -35,13 +35,19 @@ import secrets as _secrets
 app = Flask(__name__)
 
 # Static site (index.html / assets) lives next to this file by default.
-WEB_DIR = os.environ.get("WEB_DIR", os.path.join(os.path.abspath(os.path.dirname(__file__)), "web"))
+_BASE_FOR_WEB = os.path.abspath(os.path.dirname(__file__))
+_WEB_DEFAULT = os.path.join(_BASE_FOR_WEB, "web")
+_WEB_ROOT_INDEX = os.path.join(_BASE_FOR_WEB, "index.html")
+WEB_DIR = os.environ.get("WEB_DIR") or (
+    _BASE_FOR_WEB if os.path.isfile(_WEB_ROOT_INDEX)
+    else (_WEB_DEFAULT if os.path.isdir(_WEB_DEFAULT) else _BASE_FOR_WEB)
+)
 
 # Every /api/* route requires this bearer token. Set ADMIN_API_TOKEN yourself
 # in production; if left unset we generate one at startup and print it once
 # so the dashboard still works, but you should pin a real value via env vars.
-ADMIN_API_TOKEN = os.environ.get("8032494974:AAE3s6Uh0c-KdWsXDd5ZP_R6h6KixSUt-dw") or _secrets.token_urlsafe(24)
-if not os.environ.get("2119464081"):
+ADMIN_API_TOKEN = os.environ.get("ADMIN_API_TOKEN") or _secrets.token_urlsafe(24)
+if not os.environ.get("ADMIN_API_TOKEN"):
     print(f"⚠️  ADMIN_API_TOKEN not set — generated a temporary one for this run:\n    {ADMIN_API_TOKEN}\n"
           f"    Set ADMIN_API_TOKEN in your environment to keep it stable across restarts.")
 
@@ -74,8 +80,15 @@ def _add_cors_headers(resp):
 def home():
     index_path = os.path.join(WEB_DIR, "index.html")
     if os.path.isfile(index_path):
+        try:
+            with open(index_path, "r", encoding="utf-8") as f:
+                html = f.read()
+            html = html.replace("__ADMIN_API_TOKEN__", ADMIN_API_TOKEN)
+            return html
+        except Exception:
+            pass
         return send_from_directory(WEB_DIR, "index.html")
-    return "bot is running...."
+    return "bot is running...." 
 
 @app.route('/<path:filename>')
 def static_files(filename):
@@ -97,6 +110,29 @@ def keep_alive():
     t.daemon = True
     t.start()
     print("Flask Keep-Alive server + dashboard API started.")
+
+def start_userbot_backend():
+    if os.environ.get("RUN_USERBOT_BACKEND", "1").strip().lower() not in {"1", "true", "yes", "on"}:
+        logger.info("Userbot backend auto-start disabled.")
+        return None
+    script_path = os.environ.get("USERBOT_SCRIPT", os.path.join(BASE_DIR, "lastuser.py"))
+    if not os.path.isfile(script_path):
+        logger.warning("lastuser.py not found; userbot API bridge will remain offline.")
+        return None
+    if not os.environ.get("USERBOT_BOT_TOKEN"):
+        logger.warning("USERBOT_BOT_TOKEN is not set; lastuser.py will not be auto-started.")
+        return None
+    child_env = os.environ.copy()
+    child_env["WEB_PORT"] = os.environ.get("USERBOT_WEB_PORT", "8081")
+    child_env["ADMIN_API_TOKEN"] = ADMIN_API_TOKEN
+    child_env["BOT_TOKEN"] = os.environ["USERBOT_BOT_TOKEN"]
+    try:
+        proc = subprocess.Popen([sys.executable, script_path], cwd=BASE_DIR, env=child_env)
+        logger.info(f"Userbot backend started internally (PID {proc.pid}, WEB_PORT={child_env['WEB_PORT']}).")
+        return proc
+    except Exception as e:
+        logger.error(f"Could not start userbot backend: {e}", exc_info=True)
+        return None
 # --- End Flask Keep Alive ---
 
 # --- Configuration ---
@@ -104,7 +140,7 @@ def keep_alive():
 # file. Treat that token as compromised — rotate it with @BotFather and set
 # the new one via the BOT_TOKEN environment variable instead of editing this
 # file again.
-TOKEN = os.environ.get("BOT_TOKEN", "6248614957:AAGWzd37KASqv6u3OZRxt3gPaqkkdpmRNHg")
+TOKEN = os.environ.get("BOT_TOKEN", "")
 OWNER_ID = int(os.environ.get("OWNER_ID", "2119464081"))
 ADMIN_ID = int(os.environ.get("ADMIN_ID", str(OWNER_ID)))
 YOUR_USERNAME = os.environ.get("SUPPORT_USERNAME", "@Xricx0")
@@ -1142,6 +1178,52 @@ def api_unlock():
     global bot_locked
     bot_locked = False
     return jsonify({"ok": True, "locked": False})
+
+
+# ────────────────────────────────────────────────────────────────
+# Userbot dashboard bridge — exposes lastuser.py on the same origin
+# ────────────────────────────────────────────────────────────────
+USERBOT_BACKEND_URL = os.environ.get("USERBOT_BACKEND_URL", "http://127.0.0.1:8081").rstrip("/")
+
+@app.route('/api/userbot/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'OPTIONS'])
+def api_userbot_proxy(subpath):
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    auth = request.headers.get("Authorization", "")
+    token = auth.split(" ", 1)[1] if auth.lower().startswith("bearer ") else request.args.get("token", "")
+    if not token or not secrets_compare(token, ADMIN_API_TOKEN):
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        upstream = requests.request(
+            method=request.method,
+            url=f"{USERBOT_BACKEND_URL}/api/userbot/{subpath}",
+            params=request.args,
+            data=request.get_data(),
+            headers={
+                "Authorization": "Bearer " + ADMIN_API_TOKEN,
+                "Content-Type": request.headers.get("Content-Type", "application/json"),
+            },
+            timeout=60,
+        )
+        return app.response_class(
+            response=upstream.content,
+            status=upstream.status_code,
+            content_type=upstream.headers.get("Content-Type", "application/json"),
+        )
+    except requests.RequestException as e:
+        logger.error(f"Userbot API bridge error: {e}")
+        return jsonify({"error": "userbot backend unavailable", "details": str(e)[:200]}), 502
+
+@app.route('/api/system')
+@require_admin_token
+def api_system():
+    try:
+        cpu = psutil.cpu_percent(interval=0.1)
+        mem = psutil.virtual_memory()
+        return jsonify({"cpu": cpu, "memory": mem.percent,
+                        "port": int(os.environ.get("PORT", 8080)), "pid": os.getpid()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # --- End Dashboard REST API ---
 
@@ -2753,6 +2835,7 @@ if __name__ == '__main__':
                 f"🔧 Base Dir: {BASE_DIR}\n📁 Upload Dir: {UPLOAD_BOTS_DIR}\n" +
                 f"📊 Data Dir: {IROTECH_DIR}\n🔑 Owner ID: {OWNER_ID}\n🛡️ Admins: {admin_ids}\n" + "="*40)
     keep_alive()
+    start_userbot_backend()
     logger.info("🚀 Starting polling...")
     while True:
         try:
