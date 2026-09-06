@@ -35,19 +35,13 @@ import secrets as _secrets
 app = Flask(__name__)
 
 # Static site (index.html / assets) lives next to this file by default.
-_BASE_FOR_WEB = os.path.abspath(os.path.dirname(__file__))
-_WEB_DEFAULT = os.path.join(_BASE_FOR_WEB, "web")
-_WEB_ROOT_INDEX = os.path.join(_BASE_FOR_WEB, "index.html")
-WEB_DIR = os.environ.get("WEB_DIR") or (
-    _BASE_FOR_WEB if os.path.isfile(_WEB_ROOT_INDEX)
-    else (_WEB_DEFAULT if os.path.isdir(_WEB_DEFAULT) else _BASE_FOR_WEB)
-)
+WEB_DIR = os.environ.get("WEB_DIR", os.path.join(os.path.abspath(os.path.dirname(__file__)), "web"))
 
 # Every /api/* route requires this bearer token. Set ADMIN_API_TOKEN yourself
 # in production; if left unset we generate one at startup and print it once
 # so the dashboard still works, but you should pin a real value via env vars.
-ADMIN_API_TOKEN = os.environ.get("some-long-random-secret") or _secrets.token_urlsafe(24)
-if not os.environ.get("2119464081"):
+ADMIN_API_TOKEN = os.environ.get("ADMIN_API_TOKEN") or _secrets.token_urlsafe(24)
+if not os.environ.get("ADMIN_API_TOKEN"):
     print(f"⚠️  ADMIN_API_TOKEN not set — generated a temporary one for this run:\n    {ADMIN_API_TOKEN}\n"
           f"    Set ADMIN_API_TOKEN in your environment to keep it stable across restarts.")
 
@@ -69,8 +63,6 @@ def secrets_compare(a, b):
 
 @app.after_request
 def _add_cors_headers(resp):
-    # Same-origin dashboards don't need this, but it's harmless to allow the
-    # panel to be hosted on a different domain/port than the bot process.
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
@@ -80,15 +72,8 @@ def _add_cors_headers(resp):
 def home():
     index_path = os.path.join(WEB_DIR, "index.html")
     if os.path.isfile(index_path):
-        try:
-            with open(index_path, "r", encoding="utf-8") as f:
-                html = f.read()
-            html = html.replace("__ADMIN_API_TOKEN__", ADMIN_API_TOKEN)
-            return html
-        except Exception:
-            pass
         return send_from_directory(WEB_DIR, "index.html")
-    return "bot is running...." 
+    return "bot is running...."
 
 @app.route('/<path:filename>')
 def static_files(filename):
@@ -97,9 +82,182 @@ def static_files(filename):
         return send_from_directory(WEB_DIR, filename)
     return home()
 
-@app.route('/api/health')
-def api_health():
-    return jsonify({"status": "ok", "locked": bot_locked})
+# --------------------------------------------------------------
+# PROXY: forward all /api/userbot/* requests to the userbot service
+# (which runs on port 8081 by default)
+# --------------------------------------------------------------
+@app.route('/api/userbot/<path:subpath>', methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'])
+def proxy_userbot(subpath):
+    target_url = f"http://localhost:8081/api/userbot/{subpath}"
+
+    # Copy headers, remove 'Host' to avoid conflicts
+    headers = {k: v for k, v in request.headers if k.lower() != 'host'}
+
+    # Forward the request body (if any)
+    data = request.get_data()
+
+    try:
+        resp = requests.request(
+            method=request.method,
+            url=target_url,
+            headers=headers,
+            data=data,
+            timeout=10
+        )
+        # Return the proxied response with the same status and headers
+        return (resp.content, resp.status_code, resp.headers.items())
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": "Userbot API unavailable", "detail": str(e)}), 503
+
+# --------------------------------------------------------------
+# Bot hosting REST endpoints (unchanged)
+# --------------------------------------------------------------
+@app.route('/api/stats')
+@require_admin_token
+def api_stats():
+    return jsonify({
+        "running": len(bot_scripts),
+        "users": len(active_users),
+        "subscriptions": len(user_subscriptions),
+        "files": sum(len(v) for v in user_files.values()),
+        "admins": len(admin_ids),
+        "locked": bot_locked,
+    })
+
+@app.route('/api/scripts')
+@require_admin_token
+def api_scripts():
+    out = []
+    for key, info in bot_scripts.items():
+        proc = info.get('process')
+        pid = getattr(proc, 'pid', None)
+        alive = proc is not None and proc.poll() is None
+        uptime = (datetime.now() - info['start_time']).total_seconds() if info.get('start_time') else 0
+        out.append({
+            "key": key, "file_name": info.get('file_name'), "type": info.get('type'),
+            "owner": info.get('script_owner_id'), "pid": pid,
+            "status": "running" if alive else "stopped",
+            "uptime": int(uptime),
+        })
+    return jsonify({"scripts": out})
+
+@app.route('/api/scripts/<path:script_key>/stop', methods=['POST'])
+@require_admin_token
+def api_stop_script(script_key):
+    info = bot_scripts.get(script_key)
+    if not info:
+        return jsonify({"error": "not found"}), 404
+    kill_process_tree(info)
+    bot_scripts.pop(script_key, None)
+    return jsonify({"ok": True})
+
+@app.route('/api/scripts/<path:script_key>/log')
+@require_admin_token
+def api_script_log(script_key):
+    info = bot_scripts.get(script_key)
+    if not info:
+        return jsonify({"error": "not found"}), 404
+    file_name = info.get('file_name', '')
+    log_path = os.path.join(info.get('user_folder', ''), f"{os.path.splitext(file_name)[0]}.log")
+    lines_wanted = int(request.args.get('lines', 200))
+    if not os.path.isfile(log_path):
+        return jsonify({"log": ""})
+    try:
+        with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()[-lines_wanted:]
+        return jsonify({"log": "".join(lines)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/files')
+@require_admin_token
+def api_files():
+    out = []
+    for uid, files in user_files.items():
+        for file_name, file_type in files:
+            out.append({"user_id": uid, "file_name": file_name, "file_type": file_type})
+    return jsonify({"files": out})
+
+@app.route('/api/subscriptions', methods=['GET', 'POST'])
+@require_admin_token
+def api_subscriptions():
+    if request.method == 'POST':
+        data = request.get_json(force=True, silent=True) or {}
+        try:
+            uid = int(data['user_id']); days = int(data.get('days', 30))
+        except (KeyError, ValueError, TypeError):
+            return jsonify({"error": "user_id and days required"}), 400
+        expiry = datetime.now() + timedelta(days=days)
+        save_subscription(uid, expiry)
+        return jsonify({"ok": True, "user_id": uid, "expiry": expiry.isoformat()})
+    out = [{"user_id": uid, "expiry": v['expiry'].isoformat()} for uid, v in user_subscriptions.items()]
+    return jsonify({"subscriptions": out})
+
+@app.route('/api/subscriptions/<int:user_id>', methods=['DELETE'])
+@require_admin_token
+def api_delete_subscription(user_id):
+    remove_subscription_db(user_id)
+    return jsonify({"ok": True})
+
+@app.route('/api/admins', methods=['GET', 'POST'])
+@require_admin_token
+def api_admins():
+    if request.method == 'POST':
+        data = request.get_json(force=True, silent=True) or {}
+        try:
+            uid = int(data['user_id'])
+        except (KeyError, ValueError, TypeError):
+            return jsonify({"error": "user_id required"}), 400
+        add_admin_db(uid)
+        return jsonify({"ok": True, "user_id": uid})
+    return jsonify({"admins": sorted(admin_ids)})
+
+@app.route('/api/admins/<int:user_id>', methods=['DELETE'])
+@require_admin_token
+def api_delete_admin(user_id):
+    ok = remove_admin_db(user_id)
+    return jsonify({"ok": ok})
+
+@app.route('/api/broadcast', methods=['POST'])
+@require_admin_token
+def api_broadcast():
+    data = request.get_json(force=True, silent=True) or {}
+    message = (data.get('message') or '').strip()
+    if not message:
+        return jsonify({"error": "message required"}), 400
+    sent, failed = 0, 0
+    for uid in list(active_users):
+        try:
+            bot.send_message(uid, message, parse_mode='Markdown')
+            sent += 1
+        except Exception:
+            failed += 1
+        time.sleep(0.05)
+    return jsonify({"ok": True, "sent": sent, "failed": failed})
+
+@app.route('/api/security')
+@require_admin_token
+def api_security():
+    return jsonify({
+        "locked": bot_locked,
+        "running_scripts": len(bot_scripts),
+    })
+
+@app.route('/api/lock', methods=['POST'])
+@require_admin_token
+def api_lock():
+    global bot_locked
+    bot_locked = True
+    return jsonify({"ok": True, "locked": True})
+
+@app.route('/api/unlock', methods=['POST'])
+@require_admin_token
+def api_unlock():
+    global bot_locked
+    bot_locked = False
+    return jsonify({"ok": True, "locked": False})
+
+# --------------------- end Flask routes -------------------------
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -111,36 +269,8 @@ def keep_alive():
     t.start()
     print("Flask Keep-Alive server + dashboard API started.")
 
-def start_userbot_backend():
-    if os.environ.get("RUN_USERBOT_BACKEND", "1").strip().lower() not in {"1", "true", "yes", "on"}:
-        logger.info("Userbot backend auto-start disabled.")
-        return None
-    script_path = os.environ.get("USERBOT_SCRIPT", os.path.join(BASE_DIR, "lastuser.py"))
-    if not os.path.isfile(script_path):
-        logger.warning("lastuser.py not found; userbot API bridge will remain offline.")
-        return None
-    if not os.environ.get("USERBOT_BOT_TOKEN"):
-        logger.warning("USERBOT_BOT_TOKEN is not set; lastuser.py will not be auto-started.")
-        return None
-    child_env = os.environ.copy()
-    child_env["WEB_PORT"] = os.environ.get("USERBOT_WEB_PORT", "8081")
-    child_env["ADMIN_API_TOKEN"] = ADMIN_API_TOKEN
-    child_env["BOT_TOKEN"] = os.environ["USERBOT_BOT_TOKEN"]
-    try:
-        proc = subprocess.Popen([sys.executable, script_path], cwd=BASE_DIR, env=child_env)
-        logger.info(f"Userbot backend started internally (PID {proc.pid}, WEB_PORT={child_env['WEB_PORT']}).")
-        return proc
-    except Exception as e:
-        logger.error(f"Could not start userbot backend: {e}", exc_info=True)
-        return None
-# --- End Flask Keep Alive ---
-
 # --- Configuration ---
-# SECURITY NOTE: a bot token was previously hardcoded here and shared in this
-# file. Treat that token as compromised — rotate it with @BotFather and set
-# the new one via the BOT_TOKEN environment variable instead of editing this
-# file again.
-TOKEN = os.environ.get("BOT_TOKEN", "")
+TOKEN = os.environ.get("BOT_TOKEN", "6248614957:AAGWzd37KASqv6u3OZRxt3gPaqkkdpmRNHg")
 OWNER_ID = int(os.environ.get("OWNER_ID", "2119464081"))
 ADMIN_ID = int(os.environ.get("ADMIN_ID", str(OWNER_ID)))
 YOUR_USERNAME = os.environ.get("SUPPORT_USERNAME", "@Xricx0")
@@ -290,60 +420,6 @@ def load_data():
         logger.info(f"Data loaded: {len(active_users)} users, {len(user_subscriptions)} subscriptions, {len(admin_ids)} admins.")
     except Exception as e:
         logger.error(f"❌ Error loading data: {e}", exc_info=True)
-        # --- TELETHON CORE ENGINE CORES ---
-def start_asyncio_loop(loop, coro):
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(coro)
-
-async def deploy_custom_runtime(chat_id, uid, state):
-    script_path = state["script_path"]
-    user_api_id = state["api_id"]
-    user_api_hash = state["api_hash"]
-    
-    bot.send_message(chat_id, "🛡️ **Signature Validated.** Merging userbot instance into async runtime...")
-    await state["client"].disconnect()
-    
-    old_session = f"auth_temp_{uid}.session"
-    new_session = f"user_session_{uid}"
-    
-    if os.path.exists(old_session):
-        if os.path.exists(f"{new_session}.session"): 
-            os.remove(f"{new_session}.session")
-        os.rename(old_session, new_session + ".session")
-        
-    try:
-        live_userbot = TelegramClient(new_session, int(user_api_id), user_api_hash)
-        await live_userbot.connect()
-        
-        spec = importlib.util.spec_from_file_location(f"dynamic_mod_{uid}", script_path)
-        user_module = importlib.util.module_from_spec(spec)
-        user_module.client = live_userbot 
-        spec.loader.exec_module(user_module)
-        
-        asyncio.create_task(live_userbot.start())
-        
-        success_message = f"""🚀 **DYNAMIC USERBOT RUNTIME ONLINE** 🚀
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✨ **System Status:** `RUNNING`
-📂 **Target File:** `{os.path.basename(script_path)}`
-🔐 **Session ID:** `{new_session}`
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🌟 Setup complete! Your userbot is now safely running alongside your main bot loop."""
-        bot.send_message(chat_id, success_message)
-        
-    except Exception as e:
-        bot.send_message(chat_id, f"❌ **Process Core Allocation Fault:** `{e}`")
-    
-    if uid in runtime_states: 
-        del runtime_states[uid]
-
-def extract_credentials_from_text(text):
-    api_id, api_hash = None, None
-    id_match = re.search(r'(?:API_ID)\s*=\s*[\'"]?(\d+)[\'"]?', text, re.IGNORECASE)
-    hash_match = re.search(r'(?:API_HASH)\s*=\s*[\'"]?([a-fA-Z0-9a-f]{32})[\'"]?', text, re.IGNORECASE)
-    if id_match: api_id = id_match.group(1)
-    if hash_match: api_hash = hash_match.group(1)
-    return api_id, api_hash
 
 # Initialize DB and Load Data at startup
 init_db()
@@ -351,11 +427,8 @@ load_data()
 # --- End Database Setup ---
 
 # --- Malware Detection Functions ---
-# Replace the magic import and is_suspicious_file function
-
 def get_file_type(file_content):
     """Determine file type using magic numbers and mimetypes"""
-    # Common file signatures
     signatures = {
         b'\x7fELF': 'application/x-executable',
         b'MZ': 'application/x-dosexec',
@@ -364,83 +437,56 @@ def get_file_type(file_content):
         b'PK': 'application/zip',
         b'Rar!': 'application/x-rar',
     }
-    
     for signature, mime_type in signatures.items():
         if file_content.startswith(signature):
             return mime_type
-    
-    # Fallback to extension-based detection or return unknown
     return 'application/octet-stream'
 
 def is_suspicious_file(file_content, file_name):
-    """
-    Check if file contains malware signatures, encrypted content, or suspicious keywords.
-    Returns (is_suspicious, reason)
-    """
+    """Check if file contains malware signatures, encrypted content, or suspicious keywords."""
     file_lower = file_name.lower()
-    
-    # Check file extensions first (same as before)
     suspicious_extensions = ['.exe', '.dll', '.bat', '.cmd', '.scr', '.com', '.pif', '.application', '.gadget',
                             '.msi', '.msp', '.com', '.scr', '.hta', '.cpl', '.msc', '.jar', '.bin', '.deb', '.rpm',
                             '.apk', '.app', '.dmg', '.iso', '.img']
-    
     if any(file_lower.endswith(ext) for ext in suspicious_extensions):
         return True, f"Suspicious file extension: {file_name}"
-    
-    # Check for malware signatures in file content
     for signature in MALWARE_SIGNATURES:
         if file_content.startswith(signature):
             return True, f"Malware signature detected: {signature}"
-    
-    # Check for encrypted file indicators
     sample_size = min(len(file_content), 4096)
     file_sample = file_content[:sample_size]
-    
     for indicator in ENCRYPTED_FILE_INDICATORS:
         if indicator in file_sample:
             return True, f"Encrypted file indicator: {indicator.decode('utf-8', errors='ignore')}"
-    
-    # Check for suspicious keywords in first 8KB
     sample_text = file_sample.decode('utf-8', errors='ignore').lower()
     for keyword in SUSPICIOUS_KEYWORDS:
         if keyword.decode('utf-8').lower() in sample_text:
             return True, f"Suspicious keyword found: {keyword.decode('utf-8')}"
-    
-    # Check file type using our custom function instead of magic
     try:
         file_type = get_file_type(file_sample)
         if file_type in ['application/x-dosexec', 'application/x-executable', 'application/x-mach-binary']:
             return True, f"Executable file type detected: {file_type}"
     except Exception as e:
         logger.warning(f"Could not determine file type: {e}")
-    
     return False, "File appears safe"
 
 def scan_file_for_malware(file_content, file_name, user_id):
-    """
-    Comprehensive malware scan for uploaded files.
-    Only owner can bypass these checks.
-    """
+    """Comprehensive malware scan for uploaded files. Only owner can bypass."""
     if user_id == OWNER_ID:
         return True, "Owner bypassed security check"
-    
     is_suspicious, reason = is_suspicious_file(file_content, file_name)
-    
     if is_suspicious:
         logger.warning(f"🚨 Malware detected in {file_name} from user {user_id}: {reason}")
         return False, f"Security violation: {reason}"
-    
     return True, "File passed security check"
 
 # --- Helper Functions ---
 def get_user_folder(user_id):
-    """Get or create user's folder for storing files"""
     user_folder = os.path.join(UPLOAD_BOTS_DIR, str(user_id))
     os.makedirs(user_folder, exist_ok=True)
     return user_folder
 
 def get_user_file_limit(user_id):
-    """Get the file upload limit for a user"""
     if user_id == OWNER_ID: return OWNER_LIMIT
     if user_id in admin_ids: return ADMIN_LIMIT
     if user_id in user_subscriptions and user_subscriptions[user_id]['expiry'] > datetime.now():
@@ -448,11 +494,9 @@ def get_user_file_limit(user_id):
     return FREE_USER_LIMIT
 
 def get_user_file_count(user_id):
-    """Get the number of files uploaded by a user"""
     return len(user_files.get(user_id, []))
 
 def is_bot_running(script_owner_id, file_name):
-    """Check if a bot script is currently running for a specific user"""
     script_key = f"{script_owner_id}_{file_name}"
     script_info = bot_scripts.get(script_key)
     if script_info and script_info.get('process'):
@@ -489,7 +533,6 @@ def kill_process_tree(process_info):
     pid = None
     log_file_closed = False
     script_key = process_info.get('script_key', 'N/A')
-
     try:
         if 'log_file' in process_info and hasattr(process_info['log_file'], 'close') and not process_info['log_file'].closed:
             try:
@@ -498,7 +541,6 @@ def kill_process_tree(process_info):
                 logger.info(f"Closed log file for {script_key} (PID: {process_info.get('process', {}).get('pid', 'N/A')})")
             except Exception as log_e:
                 logger.error(f"Error closing log file during kill for {script_key}: {log_e}")
-
         process = process_info.get('process')
         if process and hasattr(process, 'pid'):
             pid = process.pid
@@ -507,7 +549,6 @@ def kill_process_tree(process_info):
                     parent = psutil.Process(pid)
                     children = parent.children(recursive=True)
                     logger.info(f"Attempting to kill process tree for {script_key} (PID: {pid}, Children: {[c.pid for c in children]})")
-
                     for child in children:
                         try:
                             child.terminate()
@@ -521,7 +562,6 @@ def kill_process_tree(process_info):
                                 logger.info(f"Killed child process {child.pid} for {script_key}")
                             except Exception as e2:
                                 logger.error(f"Failed to kill child {child.pid} for {script_key}: {e2}")
-
                     gone, alive = psutil.wait_procs(children, timeout=1)
                     for p in alive:
                         logger.warning(f"Child process {p.pid} for {script_key} still alive. Killing.")
@@ -529,7 +569,6 @@ def kill_process_tree(process_info):
                             p.kill()
                         except Exception as e:
                             logger.error(f"Failed to kill child {p.pid} for {script_key} after wait: {e}")
-
                     try:
                         parent.terminate()
                         logger.info(f"Terminated parent process {pid} for {script_key}")
@@ -548,7 +587,6 @@ def kill_process_tree(process_info):
                             logger.info(f"Killed parent process {pid} for {script_key}")
                         except Exception as e2:
                             logger.error(f"Failed to kill parent {pid} for {script_key}: {e2}")
-
                 except psutil.NoSuchProcess:
                     logger.warning(f"Process {pid or 'N/A'} for {script_key} not found during kill. Already terminated?")
             else:
@@ -561,6 +599,77 @@ def kill_process_tree(process_info):
         logger.error(f"❌ Unexpected error killing process tree for PID {pid or 'N/A'} ({script_key}): {e}", exc_info=True)
 
 # --- Automatic Package Installation & Script Running ---
+TELEGRAM_MODULES = {
+    'telebot': 'pyTelegramBotAPI',
+    'telegram': 'python-telegram-bot',
+    'python_telegram_bot': 'python-telegram-bot',
+    'aiogram': 'aiogram',
+    'pyrogram': 'pyrogram',
+    'telethon': 'telethon',
+    'telethon.sync': 'telethon',
+    'from telethon.sync import telegramclient': 'telethon',
+    'telepot': 'telepot',
+    'pytg': 'pytg',
+    'tgcrypto': 'tgcrypto',
+    'telegram_upload': 'telegram-upload',
+    'telegram_send': 'telegram-send',
+    'telegram_text': 'telegram-text',
+    'mtproto': 'telegram-mtproto',
+    'tl': 'telethon',
+    'telegram_utils': 'telegram-utils',
+    'telegram_logger': 'telegram-logger',
+    'telegram_handlers': 'python-telegram-handlers',
+    'telegram_redis': 'telegram-redis',
+    'telegram_sqlalchemy': 'telegram-sqlalchemy',
+    'telegram_payment': 'telegram-payment',
+    'telegram_shop': 'telegram-shop-sdk',
+    'pytest_telegram': 'pytest-telegram',
+    'telegram_debug': 'telegram-debug',
+    'telegram_scraper': 'telegram-scraper',
+    'telegram_analytics': 'telegram-analytics',
+    'telegram_nlp': 'telegram-nlp-toolkit',
+    'telegram_ai': 'telegram-ai',
+    'telegram_api': 'telegram-api-client',
+    'telegram_web': 'telegram-web-integration',
+    'telegram_games': 'telegram-games',
+    'telegram_quiz': 'telegram-quiz-bot',
+    'telegram_ffmpeg': 'telegram-ffmpeg',
+    'telegram_media': 'telegram-media-utils',
+    'telegram_2fa': 'telegram-twofa',
+    'telegram_crypto': 'telegram-crypto-bot',
+    'telegram_i18n': 'telegram-i18n',
+    'telegram_translate': 'telegram-translate',
+    'bs4': 'beautifulsoup4',
+    'requests': 'requests',
+    'pillow': 'Pillow',
+    'cv2': 'opencv-python',
+    'yaml': 'PyYAML',
+    'dotenv': 'python-dotenv',
+    'dateutil': 'python-dateutil',
+    'pandas': 'pandas',
+    'numpy': 'numpy',
+    'flask': 'Flask',
+    'django': 'Django',
+    'sqlalchemy': 'SQLAlchemy',
+    'asyncio': None,
+    'json': None,
+    'datetime': None,
+    'os': None,
+    'sys': None,
+    're': None,
+    'time': None,
+    'math': None,
+    'random': None,
+    'logging': None,
+    'threading': None,
+    'subprocess': None,
+    'zipfile': None,
+    'tempfile': None,
+    'shutil': None,
+    'sqlite3': None,
+    'psutil': 'psutil',
+    'atexit': None
+}
 
 def attempt_install_pip(module_name, message):
     package_name = TELEGRAM_MODULES.get(module_name.lower(), module_name) 
@@ -616,7 +725,7 @@ def attempt_install_npm(module_name, user_folder, message):
         return False
 
 def run_script(script_path, script_owner_id, user_folder, file_name, message_obj_for_reply, attempt=1):
-    """Run Python script. script_owner_id is used for the script_key. message_obj_for_reply is for sending feedback."""
+    """Run Python script."""
     max_attempts = 2 
     if attempt > max_attempts:
         bot.reply_to(message_obj_for_reply, f"❌ Failed to run '{file_name}' after {max_attempts} attempts. Check logs.")
@@ -728,7 +837,7 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
              del bot_scripts[script_key]
 
 def run_js_script(script_path, script_owner_id, user_folder, file_name, message_obj_for_reply, attempt=1):
-    """Run JS script. script_owner_id is used for the script_key. message_obj_for_reply is for sending feedback."""
+    """Run JS script."""
     max_attempts = 2
     if attempt > max_attempts:
         bot.reply_to(message_obj_for_reply, f"❌ Failed to run '{file_name}' after {max_attempts} attempts. Check logs.")
@@ -842,80 +951,6 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
              kill_process_tree(bot_scripts[script_key])
              del bot_scripts[script_key]
 
-# --- Map Telegram import names to actual PyPI package names ---
-TELEGRAM_MODULES = {
-    'telebot': 'pyTelegramBotAPI',
-    'telegram': 'python-telegram-bot',
-    'python_telegram_bot': 'python-telegram-bot',
-    'aiogram': 'aiogram',
-    'pyrogram': 'pyrogram',
-    'telethon': 'telethon',
-    'telethon.sync': 'telethon',
-    'from telethon.sync import telegramclient': 'telethon',
-    'telepot': 'telepot',
-    'pytg': 'pytg',
-    'tgcrypto': 'tgcrypto',
-    'telegram_upload': 'telegram-upload',
-    'telegram_send': 'telegram-send',
-    'telegram_text': 'telegram-text',
-    'mtproto': 'telegram-mtproto',
-    'tl': 'telethon',
-    'telegram_utils': 'telegram-utils',
-    'telegram_logger': 'telegram-logger',
-    'telegram_handlers': 'python-telegram-handlers',
-    'telegram_redis': 'telegram-redis',
-    'telegram_sqlalchemy': 'telegram-sqlalchemy',
-    'telegram_payment': 'telegram-payment',
-    'telegram_shop': 'telegram-shop-sdk',
-    'pytest_telegram': 'pytest-telegram',
-    'telegram_debug': 'telegram-debug',
-    'telegram_scraper': 'telegram-scraper',
-    'telegram_analytics': 'telegram-analytics',
-    'telegram_nlp': 'telegram-nlp-toolkit',
-    'telegram_ai': 'telegram-ai',
-    'telegram_api': 'telegram-api-client',
-    'telegram_web': 'telegram-web-integration',
-    'telegram_games': 'telegram-games',
-    'telegram_quiz': 'telegram-quiz-bot',
-    'telegram_ffmpeg': 'telegram-ffmpeg',
-    'telegram_media': 'telegram-media-utils',
-    'telegram_2fa': 'telegram-twofa',
-    'telegram_crypto': 'telegram-crypto-bot',
-    'telegram_i18n': 'telegram-i18n',
-    'telegram_translate': 'telegram-translate',
-    'bs4': 'beautifulsoup4',
-    'requests': 'requests',
-    'pillow': 'Pillow',
-    'cv2': 'opencv-python',
-    'yaml': 'PyYAML',
-    'dotenv': 'python-dotenv',
-    'dateutil': 'python-dateutil',
-    'pandas': 'pandas',
-    'numpy': 'numpy',
-    'flask': 'Flask',
-    'django': 'Django',
-    'sqlalchemy': 'SQLAlchemy',
-    'asyncio': None,
-    'json': None,
-    'datetime': None,
-    'os': None,
-    'sys': None,
-    're': None,
-    'time': None,
-    'math': None,
-    'random': None,
-    'logging': None,
-    'threading': None,
-    'subprocess': None,
-    'zipfile': None,
-    'tempfile': None,
-    'shutil': None,
-    'sqlite3': None,
-    'psutil': 'psutil',
-    'atexit': None
-}
-# --- End Automatic Package Installation & Script Running ---
-
 # --- Database Operations ---
 DB_LOCK = threading.Lock() 
 
@@ -1028,205 +1063,6 @@ def remove_admin_db(admin_id):
         finally: conn.close()
 # --- End Database Operations ---
 
-# ════════════════════════════════════════════════════════════════
-#   DASHBOARD REST API — reads/controls the SAME in-memory state
-#   and SQLite DB the Telegram bot itself uses, so the panel shows
-#   what's actually running, not a mirrored copy.
-# ════════════════════════════════════════════════════════════════
-
-@app.route('/api/stats')
-@require_admin_token
-def api_stats():
-    return jsonify({
-        "running": len(bot_scripts),
-        "users": len(active_users),
-        "subscriptions": len(user_subscriptions),
-        "files": sum(len(v) for v in user_files.values()),
-        "admins": len(admin_ids),
-        "locked": bot_locked,
-    })
-
-@app.route('/api/scripts')
-@require_admin_token
-def api_scripts():
-    out = []
-    for key, info in bot_scripts.items():
-        proc = info.get('process')
-        pid = getattr(proc, 'pid', None)
-        alive = proc is not None and proc.poll() is None
-        uptime = (datetime.now() - info['start_time']).total_seconds() if info.get('start_time') else 0
-        out.append({
-            "key": key, "file_name": info.get('file_name'), "type": info.get('type'),
-            "owner": info.get('script_owner_id'), "pid": pid,
-            "status": "running" if alive else "stopped",
-            "uptime": int(uptime),
-        })
-    return jsonify({"scripts": out})
-
-@app.route('/api/scripts/<path:script_key>/stop', methods=['POST'])
-@require_admin_token
-def api_stop_script(script_key):
-    info = bot_scripts.get(script_key)
-    if not info:
-        return jsonify({"error": "not found"}), 404
-    kill_process_tree(info)
-    bot_scripts.pop(script_key, None)
-    return jsonify({"ok": True})
-
-@app.route('/api/scripts/<path:script_key>/log')
-@require_admin_token
-def api_script_log(script_key):
-    info = bot_scripts.get(script_key)
-    if not info:
-        return jsonify({"error": "not found"}), 404
-    file_name = info.get('file_name', '')
-    log_path = os.path.join(info.get('user_folder', ''), f"{os.path.splitext(file_name)[0]}.log")
-    lines_wanted = int(request.args.get('lines', 200))
-    if not os.path.isfile(log_path):
-        return jsonify({"log": ""})
-    try:
-        with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = f.readlines()[-lines_wanted:]
-        return jsonify({"log": "".join(lines)})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/files')
-@require_admin_token
-def api_files():
-    out = []
-    for uid, files in user_files.items():
-        for file_name, file_type in files:
-            out.append({"user_id": uid, "file_name": file_name, "file_type": file_type})
-    return jsonify({"files": out})
-
-@app.route('/api/subscriptions', methods=['GET', 'POST'])
-@require_admin_token
-def api_subscriptions():
-    if request.method == 'POST':
-        data = request.get_json(force=True, silent=True) or {}
-        try:
-            uid = int(data['user_id']); days = int(data.get('days', 30))
-        except (KeyError, ValueError, TypeError):
-            return jsonify({"error": "user_id and days required"}), 400
-        expiry = datetime.now() + timedelta(days=days)
-        save_subscription(uid, expiry)
-        return jsonify({"ok": True, "user_id": uid, "expiry": expiry.isoformat()})
-    out = [{"user_id": uid, "expiry": v['expiry'].isoformat()} for uid, v in user_subscriptions.items()]
-    return jsonify({"subscriptions": out})
-
-@app.route('/api/subscriptions/<int:user_id>', methods=['DELETE'])
-@require_admin_token
-def api_delete_subscription(user_id):
-    remove_subscription_db(user_id)
-    return jsonify({"ok": True})
-
-@app.route('/api/admins', methods=['GET', 'POST'])
-@require_admin_token
-def api_admins():
-    if request.method == 'POST':
-        data = request.get_json(force=True, silent=True) or {}
-        try:
-            uid = int(data['user_id'])
-        except (KeyError, ValueError, TypeError):
-            return jsonify({"error": "user_id required"}), 400
-        add_admin_db(uid)
-        return jsonify({"ok": True, "user_id": uid})
-    return jsonify({"admins": sorted(admin_ids)})
-
-@app.route('/api/admins/<int:user_id>', methods=['DELETE'])
-@require_admin_token
-def api_delete_admin(user_id):
-    ok = remove_admin_db(user_id)
-    return jsonify({"ok": ok})
-
-@app.route('/api/broadcast', methods=['POST'])
-@require_admin_token
-def api_broadcast():
-    data = request.get_json(force=True, silent=True) or {}
-    message = (data.get('message') or '').strip()
-    if not message:
-        return jsonify({"error": "message required"}), 400
-    sent, failed = 0, 0
-    for uid in list(active_users):
-        try:
-            bot.send_message(uid, message, parse_mode='Markdown')
-            sent += 1
-        except Exception:
-            failed += 1
-        time.sleep(0.05)  # stay comfortably under Telegram's rate limits
-    return jsonify({"ok": True, "sent": sent, "failed": failed})
-
-@app.route('/api/security')
-@require_admin_token
-def api_security():
-    return jsonify({
-        "locked": bot_locked,
-        "running_scripts": len(bot_scripts),
-    })
-
-@app.route('/api/lock', methods=['POST'])
-@require_admin_token
-def api_lock():
-    global bot_locked
-    bot_locked = True
-    return jsonify({"ok": True, "locked": True})
-
-@app.route('/api/unlock', methods=['POST'])
-@require_admin_token
-def api_unlock():
-    global bot_locked
-    bot_locked = False
-    return jsonify({"ok": True, "locked": False})
-
-
-# ────────────────────────────────────────────────────────────────
-# Userbot dashboard bridge — exposes lastuser.py on the same origin
-# ────────────────────────────────────────────────────────────────
-USERBOT_BACKEND_URL = os.environ.get("USERBOT_BACKEND_URL", "http://127.0.0.1:8081").rstrip("/")
-
-@app.route('/api/userbot/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'OPTIONS'])
-def api_userbot_proxy(subpath):
-    if request.method == 'OPTIONS':
-        return ('', 204)
-    auth = request.headers.get("Authorization", "")
-    token = auth.split(" ", 1)[1] if auth.lower().startswith("bearer ") else request.args.get("token", "")
-    if not token or not secrets_compare(token, ADMIN_API_TOKEN):
-        return jsonify({"error": "unauthorized"}), 401
-    try:
-        upstream = requests.request(
-            method=request.method,
-            url=f"{USERBOT_BACKEND_URL}/api/userbot/{subpath}",
-            params=request.args,
-            data=request.get_data(),
-            headers={
-                "Authorization": "Bearer " + ADMIN_API_TOKEN,
-                "Content-Type": request.headers.get("Content-Type", "application/json"),
-            },
-            timeout=60,
-        )
-        return app.response_class(
-            response=upstream.content,
-            status=upstream.status_code,
-            content_type=upstream.headers.get("Content-Type", "application/json"),
-        )
-    except requests.RequestException as e:
-        logger.error(f"Userbot API bridge error: {e}")
-        return jsonify({"error": "userbot backend unavailable", "details": str(e)[:200]}), 502
-
-@app.route('/api/system')
-@require_admin_token
-def api_system():
-    try:
-        cpu = psutil.cpu_percent(interval=0.1)
-        mem = psutil.virtual_memory()
-        return jsonify({"cpu": cpu, "memory": mem.percent,
-                        "port": int(os.environ.get("PORT", 8080)), "pid": os.getpid()})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# --- End Dashboard REST API ---
-
 # --- Menu creation (Inline and ReplyKeyboards) ---
 def create_main_menu_inline(user_id):
     markup = types.InlineKeyboardMarkup(row_width=2)
@@ -1235,10 +1071,9 @@ def create_main_menu_inline(user_id):
         types.InlineKeyboardButton('📤 Upload File', callback_data='upload'),
         types.InlineKeyboardButton('📂 Check Files', callback_data='check_files'),
         types.InlineKeyboardButton('⚡ Bot Speed', callback_data='speed'),
-        types.InlineKeyboardButton('📤 Send Command', callback_data='send_command'),  # Added Send Command
+        types.InlineKeyboardButton('📤 Send Command', callback_data='send_command'),
         types.InlineKeyboardButton('📞 Contact Owner', url=f'https://t.me/{YOUR_USERNAME.replace("@zucktmr", "@Gawdrebel")}')
     ]
-
     if user_id in admin_ids:
         admin_buttons = [
             types.InlineKeyboardButton('💳 Subscriptions', callback_data='subscription'),
@@ -1254,14 +1089,14 @@ def create_main_menu_inline(user_id):
         markup.add(buttons[3], admin_buttons[0])
         markup.add(admin_buttons[1], admin_buttons[3])
         markup.add(admin_buttons[2], admin_buttons[5])
-        markup.add(buttons[4])  # Send Command
+        markup.add(buttons[4])
         markup.add(admin_buttons[4])
         markup.add(buttons[5])
     else:
         markup.add(buttons[0])
         markup.add(buttons[1], buttons[2])
         markup.add(buttons[3])
-        markup.add(buttons[4])  # Send Command
+        markup.add(buttons[4])
         markup.add(types.InlineKeyboardButton('📊 Statistics', callback_data='stats'))
         markup.add(buttons[5])
     return markup
@@ -1331,7 +1166,6 @@ def handle_zip_file(downloaded_file_content, file_name_zip, message):
     user_folder = get_user_folder(user_id)
     temp_dir = None
     
-    # Security check for ZIP files (except owner)
     if user_id != OWNER_ID:
         is_safe, reason = scan_file_for_malware(downloaded_file_content, file_name_zip, user_id)
         if not is_safe:
@@ -1345,9 +1179,7 @@ def handle_zip_file(downloaded_file_content, file_name_zip, message):
         with open(zip_path, 'wb') as new_file:
             new_file.write(downloaded_file_content)
         
-        # Open Zip to Extract
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            # Additional security check on content
             if user_id != OWNER_ID:
                 for member in zip_ref.infolist():
                     member_name_lower = member.filename.lower()
@@ -1355,47 +1187,34 @@ def handle_zip_file(downloaded_file_content, file_name_zip, message):
                     if any(member_name_lower.endswith(ext) for ext in suspicious_extensions):
                         bot.reply_to(message, f"🚨 Security Alert: ZIP contains suspicious file: {member.filename}\nOnly owner can upload such files.")
                         return
-                    
-                    # Check for path traversal
                     member_path = os.path.abspath(os.path.join(temp_dir, member.filename))
                     if not member_path.startswith(os.path.abspath(temp_dir)):
                         raise zipfile.BadZipFile(f"Zip has unsafe path: {member.filename}")
-            
-            # Extract everything
             zip_ref.extractall(temp_dir)
             logger.info(f"Extracted zip to {temp_dir}")
 
-        # --- FIX: Recursively find script if not in root (ignores __MACOSX) ---
         target_dir = temp_dir
         root_files = os.listdir(target_dir)
         
-        # Check if script exists in root
         if not any(f.endswith(('.py', '.js')) for f in root_files):
-            # Recursively search for a folder containing .py or .js
             for root, dirs, files in os.walk(temp_dir):
-                # Ignore system/hidden folders like __MACOSX or .git
                 dirs[:] = [d for d in dirs if not d.startswith('.') and not d.startswith('__')]
-                
                 if any(f.endswith(('.py', '.js')) for f in files):
                     target_dir = root
                     break
         
-        # If the script is in a subdirectory, move everything up to temp_dir
         if target_dir != temp_dir:
             logger.info(f"Flattening extracted files from {target_dir} to {temp_dir}")
             for item in os.listdir(target_dir):
                 s = os.path.join(target_dir, item)
                 d = os.path.join(temp_dir, item)
-                # Overwrite if exists (shouldn't happen often in this temp context)
                 if os.path.exists(d):
                     if os.path.isdir(d): shutil.rmtree(d)
                     else: os.remove(d)
                 shutil.move(s, d)
-            # Refresh list after flattening
             extracted_items = os.listdir(temp_dir)
         else:
             extracted_items = root_files
-        # --- END FIX ---
 
         py_files = [f for f in extracted_items if f.endswith('.py')]
         js_files = [f for f in extracted_items if f.endswith('.js')]
@@ -1455,7 +1274,7 @@ def handle_zip_file(downloaded_file_content, file_name_zip, message):
         logger.info(f"Moving extracted files from {temp_dir} to {user_folder}")
         moved_count = 0
         for item_name in os.listdir(temp_dir):
-            if item_name == file_name_zip: continue # Don't move the zip file itself if it's there
+            if item_name == file_name_zip: continue
             src_path = os.path.join(temp_dir, item_name)
             dest_path = os.path.join(user_folder, item_name)
             if os.path.isdir(dest_path): shutil.rmtree(dest_path)
@@ -1483,6 +1302,7 @@ def handle_zip_file(downloaded_file_content, file_name_zip, message):
         if temp_dir and os.path.exists(temp_dir):
             try: shutil.rmtree(temp_dir); logger.info(f"Cleaned temp dir: {temp_dir}")
             except Exception as e: logger.error(f"Failed to clean temp dir {temp_dir}: {e}", exc_info=True)
+
 def handle_js_file(file_path, script_owner_id, user_folder, file_name, message):
     try:
         save_user_file(script_owner_id, file_name, 'js')
@@ -1501,59 +1321,44 @@ def handle_py_file(file_path, script_owner_id, user_folder, file_name, message):
 
 # --- Send Command and Enhanced Logs Functions ---
 def _logic_send_command(message):
-    """Handle send command functionality"""
     user_id = message.from_user.id
     if bot_locked and user_id not in admin_ids:
         bot.reply_to(message, "⚠️ Bot locked by admin.")
         return
-        
     bot.reply_to(message, "📤 Send Command Options:", reply_markup=create_send_command_menu())
 
 def send_to_process_init(message):
-    """Initialize process for sending command to a running script"""
     user_id = message.from_user.id
     chat_id = message.chat.id
-    
-    # Get user's running processes
     user_running_scripts = []
     for script_key, script_info in bot_scripts.items():
         script_owner_id = script_info['script_owner_id']
         if (user_id == script_owner_id or user_id in admin_ids) and is_bot_running(script_owner_id, script_info['file_name']):
             user_running_scripts.append((script_key, script_info))
-    
     if not user_running_scripts:
         bot.reply_to(message, "❌ No running scripts found.")
         return
-    
     markup = types.InlineKeyboardMarkup(row_width=1)
     for script_key, script_info in user_running_scripts:
         btn_text = f"{script_info['file_name']} (User: {script_info['script_owner_id']})"
         markup.add(types.InlineKeyboardButton(btn_text, callback_data=f'sendcmd_select_{script_key}'))
-    
     markup.add(types.InlineKeyboardButton("🔙 Back", callback_data='send_command'))
     bot.reply_to(message, "📝 Select a running script to send command to:", reply_markup=markup)
 
 def process_send_command(message, script_key):
-    """Process the actual command to send to the script"""
     user_id = message.from_user.id
     chat_id = message.chat.id
-    
     if script_key not in bot_scripts:
         bot.reply_to(message, "❌ Script no longer running.")
         return
-    
     script_info = bot_scripts[script_key]
     command_text = message.text
-    
     try:
         process = script_info['process']
         if process and process.poll() is None:
-            # Send command to process stdin
             process.stdin.write(command_text + '\n')
             process.stdin.flush()
             bot.reply_to(message, f"✅ Command sent to `{script_info['file_name']}`:\n`{command_text}`", parse_mode='Markdown')
-            
-            # Wait a bit and check if process is still running
             time.sleep(1)
             if process.poll() is not None:
                 bot.reply_to(message, f"⚠️ Script `{script_info['file_name']}` stopped after receiving command.")
@@ -1564,13 +1369,9 @@ def process_send_command(message, script_key):
         bot.reply_to(message, f"❌ Error sending command: {str(e)}")
 
 def view_all_logs(message):
-    """Show all available logs for user"""
     user_id = message.from_user.id
     chat_id = message.chat.id
-    
     user_logs = []
-    
-    # Get user's folder and all log files
     user_folder = get_user_folder(user_id)
     if os.path.exists(user_folder):
         for file in os.listdir(user_folder):
@@ -1578,31 +1379,25 @@ def view_all_logs(message):
                 log_path = os.path.join(user_folder, file)
                 file_size = os.path.getsize(log_path)
                 user_logs.append((file, file_size, log_path))
-    
     if not user_logs:
         bot.reply_to(message, "📜 No log files found.")
         return
-    
     markup = types.InlineKeyboardMarkup(row_width=1)
     for log_file, size, log_path in sorted(user_logs):
         size_kb = size / 1024
         btn_text = f"{log_file} ({size_kb:.1f} KB)"
         markup.add(types.InlineKeyboardButton(btn_text, callback_data=f'viewlog_{user_id}_{log_file}'))
-    
     markup.add(types.InlineKeyboardButton("🔙 Back", callback_data='send_command'))
     bot.reply_to(message, "📜 Available Log Files:", reply_markup=markup)
 
 def send_log_file(message, log_path, log_filename):
-    """Send log file as document"""
     try:
         file_size = os.path.getsize(log_path)
-        if file_size > 50 * 1024 * 1024:  # 50MB limit
+        if file_size > 50 * 1024 * 1024:
             bot.reply_to(message, f"❌ Log file too large ({file_size/1024/1024:.1f} MB). Maximum 50MB.")
             return
-        
         with open(log_path, 'rb') as log_file:
             bot.send_document(message.chat.id, log_file, caption=f"📜 {log_filename}")
-            
     except Exception as e:
         logger.error(f"Error sending log file {log_path}: {e}")
         bot.reply_to(message, f"❌ Error sending log file: {str(e)}")
@@ -1677,7 +1472,6 @@ def _logic_upload_file(message):
     if bot_locked and user_id not in admin_ids:
         bot.reply_to(message, "⚠️ Bot locked by admin, cannot accept files.")
         return
-
     file_limit = get_user_file_limit(user_id)
     current_files = get_user_file_count(user_id)
     if current_files >= file_limit:
@@ -1869,7 +1663,7 @@ BUTTON_TEXT_TO_LOGIC = {
     "📤 Upload File": _logic_upload_file,
     "📂 Check Files": _logic_check_files,
     "⚡ Bot Speed": _logic_bot_speed,
-    "📤 Send Command": _logic_send_command,  # Added Send Command
+    "📤 Send Command": _logic_send_command,
     "📞 Contact Owner": _logic_contact_owner,
     "📊 Statistics": _logic_statistics,
     "💳 Subscriptions": _logic_subscriptions_panel,
@@ -1893,7 +1687,7 @@ def command_upload_file(message): _logic_upload_file(message)
 def command_check_files(message): _logic_check_files(message)
 @bot.message_handler(commands=['botspeed'])
 def command_bot_speed(message): _logic_bot_speed(message)
-@bot.message_handler(commands=['sendcommand'])  # Added Send Command
+@bot.message_handler(commands=['sendcommand'])
 def command_send_command(message): _logic_send_command(message)
 @bot.message_handler(commands=['contactowner'])
 def command_contact_owner(message): _logic_contact_owner(message)
@@ -1956,7 +1750,6 @@ def handle_file_upload_doc(message):
         file_info_tg_doc = bot.get_file(doc.file_id)
         downloaded_file_content = bot.download_file(file_info_tg_doc.file_path)
         
-        # Malware scan (except for owner)
         if user_id != OWNER_ID:
             is_safe, reason = scan_file_for_malware(downloaded_file_content, file_name, user_id)
             if not is_safe:
@@ -2007,13 +1800,11 @@ def handle_callbacks(call):
         elif data == 'back_to_main': back_to_main_callback(call)
         elif data.startswith('confirm_broadcast_'): handle_confirm_broadcast(call)
         elif data == 'cancel_broadcast': handle_cancel_broadcast(call)
-        # --- New Send Command Callbacks ---
         elif data == 'send_command': send_command_callback(call)
         elif data == 'send_to_process': send_to_process_callback(call)
         elif data.startswith('sendcmd_select_'): sendcmd_select_callback(call)
         elif data == 'view_all_logs': view_all_logs_callback(call)
         elif data.startswith('viewlog_'): viewlog_callback(call)
-        # --- Admin Callbacks ---
         elif data == 'subscription': admin_required_callback(call, subscription_management_callback)
         elif data == 'stats': stats_callback(call)
         elif data == 'lock_bot': admin_required_callback(call, lock_bot_callback)
@@ -2081,26 +1872,19 @@ def viewlog_callback(call):
         _, user_id_str, log_filename = call.data.split('_', 2)
         user_id = int(user_id_str)
         requesting_user_id = call.from_user.id
-        
         if not (requesting_user_id == user_id or requesting_user_id in admin_ids):
             bot.answer_callback_query(call.id, "⚠️ You can only view your own logs.", show_alert=True)
             return
-            
         user_folder = get_user_folder(user_id)
         log_path = os.path.join(user_folder, log_filename)
-        
         if not os.path.exists(log_path):
             bot.answer_callback_query(call.id, "❌ Log file not found.", show_alert=True)
             return
-            
         bot.answer_callback_query(call.id, "📜 Sending log file...")
         send_log_file(call.message, log_path, log_filename)
-        
     except Exception as e:
         logger.error(f"Error in viewlog_callback: {e}")
         bot.answer_callback_query(call.id, "Error viewing log.")
-
-# ... (rest of the existing callback functions remain the same)
 
 def upload_callback(call):
     user_id = call.from_user.id
@@ -2835,7 +2619,6 @@ if __name__ == '__main__':
                 f"🔧 Base Dir: {BASE_DIR}\n📁 Upload Dir: {UPLOAD_BOTS_DIR}\n" +
                 f"📊 Data Dir: {IROTECH_DIR}\n🔑 Owner ID: {OWNER_ID}\n🛡️ Admins: {admin_ids}\n" + "="*40)
     keep_alive()
-    start_userbot_backend()
     logger.info("🚀 Starting polling...")
     while True:
         try:
